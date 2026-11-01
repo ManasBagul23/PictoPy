@@ -54,14 +54,22 @@ def db_create_folders_table() -> None:
             conn.close()
 
 
-def db_insert_folders_batch(folders_data: List[FolderData]) -> None:
+def db_insert_folders_batch(
+    folders_data: List[FolderData],
+) -> Dict[FolderId, FolderId]:
     """
     Insert multiple folders in a single database transaction.
     folders_data: list of tuples (folder_id, folder_path,
     parent_folder_id,last_modified_time, AI_Tagging, taggingCompleted)
+
+    Returns a mapping from the folder_id of each row that was skipped as a
+    case-insensitive duplicate to the folder_id of the already-stored row it
+    matched, so a caller that pre-generated an id for a path later found to
+    be a duplicate can replace it with the id that's actually in the table.
     """
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
+    skipped_to_existing: Dict[FolderId, FolderId] = {}
 
     try:
         # INSERT OR IGNORE's dedup is the folder_path UNIQUE constraint, which
@@ -72,15 +80,18 @@ def db_insert_folders_batch(folders_data: List[FolderData]) -> None:
         # same real directory would be inserted again as a second row under a
         # fresh folder_id. Pre-filter case-insensitively instead, against both
         # what's already stored and what's earlier in this same batch.
-        cursor.execute("SELECT folder_path FROM folders")
-        seen = {os.path.normcase(row[0]) for row in cursor.fetchall()}
+        cursor.execute("SELECT folder_id, folder_path FROM folders")
+        seen = {os.path.normcase(path): folder_id for folder_id, path in cursor.fetchall()}
 
         deduped = []
         for row in folders_data:
-            normalized = os.path.normcase(row[1])
-            if normalized in seen:
+            row_id, row_path = row[0], row[1]
+            normalized = os.path.normcase(row_path)
+            existing_id = seen.get(normalized)
+            if existing_id is not None:
+                skipped_to_existing[row_id] = existing_id
                 continue
-            seen.add(normalized)
+            seen[normalized] = row_id
             deduped.append(row)
 
         cursor.executemany(
@@ -94,6 +105,8 @@ def db_insert_folders_batch(folders_data: List[FolderData]) -> None:
         raise e
     finally:
         conn.close()
+
+    return skipped_to_existing
 
 
 def db_insert_folder(

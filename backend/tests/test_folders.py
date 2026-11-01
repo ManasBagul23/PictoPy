@@ -39,6 +39,7 @@ from app.database.folders import (
 from app.database.images import db_create_images_table
 from app.database.videos import db_create_videos_table
 from app.database.yolo_mapping import db_create_YOLO_classes_table
+from app.utils.folders import folder_util_add_folder_tree
 
 # ##############################
 # Pytest Fixtures
@@ -897,6 +898,39 @@ class TestFoldersUnit:
 
         mock_conn.rollback.assert_called_once()
         mock_conn.close.assert_called_once()
+
+    def test_folder_util_add_folder_tree_reconciles_case_duplicate_root(
+        self, test_db, tmp_path
+    ):
+        # Register the root path under a different case than the one the
+        # upcoming walk will use, as if an earlier scan had already stored
+        # it (Windows paths are case-insensitive, but os.walk/the file
+        # picker can report the same real directory with different casing
+        # between scans).
+        root = tmp_path / "Photos"
+        root.mkdir()
+        (root / "sub").mkdir()
+        existing_root_path = str(root).replace("Photos", "photos")
+        existing_root_id = db_insert_folder(existing_root_path, folder_id="existing-root-id")
+        assert existing_root_id == "existing-root-id"
+
+        root_folder_id, folder_map = folder_util_add_folder_tree(str(root))
+
+        # The walk generated a fresh id for root before finding out it was a
+        # duplicate; the returned id -- and the child's recorded parent_id --
+        # must be the id the row is actually stored under, not that ghost id.
+        assert root_folder_id == "existing-root-id"
+        child_path = os.path.abspath(str(root / "sub"))
+        assert folder_map[child_path][1] == "existing-root-id"
+
+        db_update_parent_ids_for_subtree(str(root), folder_map)
+        child_id = folder_map[child_path][0]
+        conn = sqlite3.connect(test_db)
+        stored_parent_id = conn.execute(
+            "SELECT parent_folder_id FROM folders WHERE folder_id = ?", (child_id,)
+        ).fetchone()[0]
+        conn.close()
+        assert stored_parent_id == "existing-root-id"
 
     def test_db_insert_folder_generates_uuid_when_folder_id_none(
         self, test_db, tmp_path
